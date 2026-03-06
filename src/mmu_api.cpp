@@ -11,8 +11,10 @@
 #include <unistd.h>
 #endif
 
+#include "core/block_directory.h"
 #include "core/block_manager.h"
 #include "core/context.h"
+#include "internal/mmu_test_api.h"
 
 struct mmu_runtime_t;
 
@@ -38,25 +40,21 @@ struct mmu_runtime_t {
     explicit mmu_runtime_t(mmu_config_t cfg)
         : config(cfg),
           l1_allocator(std::make_shared<dsf_mmu::core::BlockManager>(cfg.l1_block_count)),
+          block_directory(std::make_shared<dsf_mmu::core::BlockDirectory>(cfg.l1_block_count)),
           l1_pool(cfg.l1_block_count),
           l2_pool(cfg.l1_block_count),
-          l1_resident(cfg.l1_block_count, 0),
-          pinned_count(cfg.l1_block_count, 0),
-          access_epoch(cfg.l1_block_count, 0),
           resident_limit(cfg.l1_resident_block_limit),
           resident_count(0),
           epoch(0) {}
 
     mmu_config_t config;
     std::shared_ptr<dsf_mmu::core::BlockManager> l1_allocator;
+    std::shared_ptr<dsf_mmu::core::BlockDirectory> block_directory;
     std::unordered_map<ctx_handle_t, std::unique_ptr<mmu_context_t>> contexts;
     std::recursive_mutex api_mutex;
 
     ChunkPool l1_pool;
     ChunkPool l2_pool;
-    std::vector<uint8_t> l1_resident;
-    std::vector<uint32_t> pinned_count;
-    std::vector<uint64_t> access_epoch;
     uint32_t resident_limit;
     uint32_t resident_count;
     uint64_t epoch;
@@ -230,14 +228,16 @@ void CopyOrZero(const uint8_t* src, uint8_t* dst, uint32_t size_bytes) {
     std::memcpy(dst, src, size_bytes);
 }
 
-void TouchBlock(mmu_runtime_t* mmu, int physical_block_id) {
-    mmu->access_epoch[physical_block_id] = ++mmu->epoch;
+const dsf_mmu::core::BlockMeta* BlockMetaFor(const mmu_runtime_t* mmu, int block_id) {
+    return mmu->block_directory->get(block_id);
 }
 
-void PropagateTierToAllContexts(mmu_runtime_t* mmu, int physical_block_id, mmu_tier_t tier) {
-    for (auto& kv : mmu->contexts) {
-        kv.second->impl.SetTierForPhysicalBlock(physical_block_id, tier);
-    }
+dsf_mmu::core::BlockMeta* MutableBlockMeta(mmu_runtime_t* mmu, int block_id) {
+    return mmu->block_directory->mutable_get(block_id);
+}
+
+void TouchBlock(mmu_runtime_t* mmu, int physical_block_id) {
+    (void)mmu->block_directory->set_last_access_epoch(physical_block_id, ++mmu->epoch);
 }
 
 mmu_status_t SyncL1ToL2(mmu_runtime_t* mmu, int physical_block_id) {
@@ -249,6 +249,8 @@ mmu_status_t SyncL1ToL2(mmu_runtime_t* mmu, int physical_block_id) {
 
     const uint8_t* src_l1 = RawPage(&mmu->l1_pool, physical_block_id);
     CopyOrZero(src_l1, dst_l2, mmu->config.block_size_bytes);
+    (void)mmu->block_directory->set_has_l2_backing(physical_block_id, true);
+    (void)mmu->block_directory->set_l2_slot_id(physical_block_id, physical_block_id);
     return MMU_STATUS_OK;
 }
 
@@ -261,12 +263,23 @@ mmu_status_t SyncL2ToL1(mmu_runtime_t* mmu, int physical_block_id) {
 
     const uint8_t* src_l2 = RawPage(&mmu->l2_pool, physical_block_id);
     CopyOrZero(src_l2, dst_l1, mmu->config.block_size_bytes);
+    (void)mmu->block_directory->set_l1_frame_id(physical_block_id, physical_block_id);
     return MMU_STATUS_OK;
 }
 
 void ResetBlockData(mmu_runtime_t* mmu, int physical_block_id) {
     ReleasePage(&mmu->l1_pool, physical_block_id);
     ReleasePage(&mmu->l2_pool, physical_block_id);
+
+    if (dsf_mmu::core::BlockMeta* meta = MutableBlockMeta(mmu, physical_block_id)) {
+        meta->resident_in_l1 = false;
+        meta->dirty = false;
+        meta->pin_count = 0;
+        meta->last_access_epoch = 0;
+        meta->l1_frame_id = dsf_mmu::core::kInvalidFrameId;
+        meta->l2_slot_id = dsf_mmu::core::kInvalidSlotId;
+        meta->has_l2_backing = false;
+    }
 }
 
 void ReclaimUnusedResidentBlocks(mmu_runtime_t* mmu) {
@@ -274,15 +287,15 @@ void ReclaimUnusedResidentBlocks(mmu_runtime_t* mmu) {
     for (int pbid = 0; pbid < block_count; ++pbid) {
         const int ref_count = mmu->l1_allocator->ref_count(pbid);
         if (ref_count == 0) {
-            if (mmu->l1_resident[pbid] != 0) {
-                mmu->l1_resident[pbid] = 0;
+            const dsf_mmu::core::BlockMeta* meta = BlockMetaFor(mmu, pbid);
+            if (meta != nullptr && meta->resident_in_l1) {
                 if (mmu->resident_count > 0) {
                     --mmu->resident_count;
                 }
             }
-            mmu->pinned_count[pbid] = 0;
-            mmu->access_epoch[pbid] = 0;
+
             ResetBlockData(mmu, pbid);
+            mmu->block_directory->reset(pbid);
         }
     }
 }
@@ -293,18 +306,19 @@ int PickEvictionCandidate(const mmu_runtime_t* mmu, int protected_pbid) {
     uint64_t oldest_epoch = std::numeric_limits<uint64_t>::max();
 
     for (int pbid = 0; pbid < block_count; ++pbid) {
-        if (mmu->l1_resident[pbid] == 0) {
+        const dsf_mmu::core::BlockMeta* meta = BlockMetaFor(mmu, pbid);
+        if (meta == nullptr || !meta->allocated || !meta->resident_in_l1) {
             continue;
         }
         if (pbid == protected_pbid) {
             continue;
         }
-        if (mmu->pinned_count[pbid] > 0) {
+        if (meta->pin_count > 0) {
             continue;
         }
 
-        if (mmu->access_epoch[pbid] < oldest_epoch) {
-            oldest_epoch = mmu->access_epoch[pbid];
+        if (meta->last_access_epoch < oldest_epoch) {
+            oldest_epoch = meta->last_access_epoch;
             victim = pbid;
         }
     }
@@ -317,20 +331,26 @@ mmu_status_t MoveBlockToL2(mmu_runtime_t* mmu, int physical_block_id) {
         return MMU_ERR_INVALID_ARGUMENT;
     }
 
-    if (mmu->l1_resident[physical_block_id] != 0) {
+    dsf_mmu::core::BlockMeta* meta = MutableBlockMeta(mmu, physical_block_id);
+    if (meta == nullptr || !meta->allocated) {
+        return MMU_ERR_INVALID_ARGUMENT;
+    }
+
+    if (meta->resident_in_l1) {
         mmu_status_t status = SyncL1ToL2(mmu, physical_block_id);
         if (status != MMU_STATUS_OK) {
             return status;
         }
 
-        mmu->l1_resident[physical_block_id] = 0;
+        meta->resident_in_l1 = false;
+        meta->l1_frame_id = dsf_mmu::core::kInvalidFrameId;
         if (mmu->resident_count > 0) {
             --mmu->resident_count;
         }
     }
 
     ReleasePage(&mmu->l1_pool, physical_block_id);
-    PropagateTierToAllContexts(mmu, physical_block_id, MMU_TIER_L2);
+    meta->tier = MMU_TIER_L2;
     return MMU_STATUS_OK;
 }
 
@@ -341,9 +361,14 @@ mmu_status_t EnsureResidentInL1(mmu_runtime_t* mmu, int physical_block_id) {
 
     ReclaimUnusedResidentBlocks(mmu);
 
-    if (mmu->l1_resident[physical_block_id] != 0) {
+    dsf_mmu::core::BlockMeta* meta = MutableBlockMeta(mmu, physical_block_id);
+    if (meta == nullptr || !meta->allocated) {
+        return MMU_ERR_INVALID_ARGUMENT;
+    }
+
+    if (meta->resident_in_l1) {
         TouchBlock(mmu, physical_block_id);
-        PropagateTierToAllContexts(mmu, physical_block_id, MMU_TIER_L1);
+        meta->tier = MMU_TIER_L1;
         return MMU_STATUS_OK;
     }
 
@@ -364,28 +389,35 @@ mmu_status_t EnsureResidentInL1(mmu_runtime_t* mmu, int physical_block_id) {
         return status;
     }
 
-    mmu->l1_resident[physical_block_id] = 1;
+    meta->resident_in_l1 = true;
+    meta->l1_frame_id = physical_block_id;
+    meta->tier = MMU_TIER_L1;
     ++mmu->resident_count;
     TouchBlock(mmu, physical_block_id);
-    PropagateTierToAllContexts(mmu, physical_block_id, MMU_TIER_L1);
     return MMU_STATUS_OK;
 }
 
 void RegisterFreshBlock(mmu_runtime_t* mmu, int physical_block_id) {
+    (void)mmu->block_directory->initialize_fresh_block(physical_block_id);
     ResetBlockData(mmu, physical_block_id);
-    mmu->pinned_count[physical_block_id] = 0;
+    dsf_mmu::core::BlockMeta* meta = MutableBlockMeta(mmu, physical_block_id);
+    if (meta == nullptr) {
+        return;
+    }
 
     if (mmu->resident_count < mmu->resident_limit) {
-        if (mmu->l1_resident[physical_block_id] == 0) {
-            mmu->l1_resident[physical_block_id] = 1;
+        if (!meta->resident_in_l1) {
+            meta->resident_in_l1 = true;
+            meta->l1_frame_id = physical_block_id;
             ++mmu->resident_count;
         }
+        meta->tier = MMU_TIER_L1;
         TouchBlock(mmu, physical_block_id);
-        PropagateTierToAllContexts(mmu, physical_block_id, MMU_TIER_L1);
     } else {
-        mmu->l1_resident[physical_block_id] = 0;
-        mmu->access_epoch[physical_block_id] = 0;
-        PropagateTierToAllContexts(mmu, physical_block_id, MMU_TIER_L2);
+        meta->resident_in_l1 = false;
+        meta->l1_frame_id = dsf_mmu::core::kInvalidFrameId;
+        meta->last_access_epoch = 0;
+        meta->tier = MMU_TIER_L2;
     }
 }
 
@@ -398,8 +430,14 @@ mmu_status_t CloneBlockDataForCow(mmu_runtime_t* mmu,
         return MMU_ERR_INVALID_ARGUMENT;
     }
 
+    const dsf_mmu::core::BlockMeta* src_meta = BlockMetaFor(mmu, src_physical_block);
+    const dsf_mmu::core::BlockMeta* dst_meta = BlockMetaFor(mmu, dst_physical_block);
+    if (src_meta == nullptr || dst_meta == nullptr) {
+        return MMU_ERR_INVALID_ARGUMENT;
+    }
+
     const uint8_t* src_ptr = nullptr;
-    if (src_tier == MMU_TIER_L1 && mmu->l1_resident[src_physical_block] != 0) {
+    if (src_tier == MMU_TIER_L1 && src_meta->resident_in_l1) {
         src_ptr = RawPage(&mmu->l1_pool, src_physical_block);
     }
     if (src_ptr == nullptr) {
@@ -415,8 +453,10 @@ mmu_status_t CloneBlockDataForCow(mmu_runtime_t* mmu,
         return status;
     }
     CopyOrZero(src_ptr, dst_l2, mmu->config.block_size_bytes);
+    (void)mmu->block_directory->set_has_l2_backing(dst_physical_block, true);
+    (void)mmu->block_directory->set_l2_slot_id(dst_physical_block, dst_physical_block);
 
-    if (mmu->l1_resident[dst_physical_block] != 0) {
+    if (dst_meta->resident_in_l1) {
         uint8_t* dst_l1 = nullptr;
         status = AcquirePage(mmu, &mmu->l1_pool, dst_physical_block, &dst_l1);
         if (status != MMU_STATUS_OK) {
@@ -533,7 +573,7 @@ mmu_status_t mmu_create_context(mmu_handle_t mmu, ctx_handle_t* out_ctx) {
     *out_ctx = nullptr;
 
     try {
-        dsf_mmu::core::Context impl(mmu->l1_allocator, mmu->config.block_size_bytes);
+        dsf_mmu::core::Context impl(mmu->l1_allocator, mmu->block_directory, mmu->config.block_size_bytes);
         auto ctx = std::make_unique<mmu_context_t>(std::move(impl));
         const ctx_handle_t handle = ctx.get();
         mmu->contexts.emplace(handle, std::move(ctx));
@@ -645,15 +685,12 @@ mmu_status_t mmu_release_logical_block(mmu_handle_t mmu, ctx_handle_t ctx, uint3
     }
 
     if (mmu->l1_allocator->ref_count(route.physical_block_id) == 0) {
-        mmu->pinned_count[route.physical_block_id] = 0;
-        mmu->access_epoch[route.physical_block_id] = 0;
-        if (mmu->l1_resident[route.physical_block_id] != 0) {
-            mmu->l1_resident[route.physical_block_id] = 0;
-            if (mmu->resident_count > 0) {
-                --mmu->resident_count;
-            }
+        const dsf_mmu::core::BlockMeta* meta = BlockMetaFor(mmu, route.physical_block_id);
+        if (meta != nullptr && meta->resident_in_l1 && mmu->resident_count > 0) {
+            --mmu->resident_count;
         }
         ResetBlockData(mmu, route.physical_block_id);
+        mmu->block_directory->reset(route.physical_block_id);
     }
 
     return MMU_STATUS_OK;
@@ -751,6 +788,8 @@ mmu_status_t mmu_prepare_block_for_write(mmu_handle_t mmu,
     }
 
     if (pbid != before.physical_block_id) {
+        (void)mmu->block_directory->initialize_fresh_block(pbid);
+        (void)mmu->block_directory->set_tier(pbid, MMU_TIER_L2);
         status = CloneBlockDataForCow(mmu, before.physical_block_id, before.tier, pbid);
         if (status != MMU_STATUS_OK) {
             return status;
@@ -809,7 +848,9 @@ mmu_status_t mmu_map_logical_block(mmu_handle_t mmu,
         return status;
     }
 
-    ++mmu->pinned_count[route.physical_block_id];
+    if (!mmu->block_directory->increment_pin_count(route.physical_block_id)) {
+        return MMU_ERR_INTERNAL;
+    }
     TouchBlock(mmu, route.physical_block_id);
 
     out_mapped_block->host_ptr = l1_page;
@@ -884,15 +925,27 @@ mmu_status_t mmu_unmap_logical_block(mmu_handle_t mmu,
         return MMU_ERR_BAD_HANDLE;
     }
 
-    if (mmu->pinned_count[pbid] > 0) {
-        --mmu->pinned_count[pbid];
+    const dsf_mmu::core::BlockMeta* meta = BlockMetaFor(mmu, pbid);
+    if (meta == nullptr || !meta->allocated) {
+        return MMU_ERR_INTERNAL;
     }
 
-    if ((mapped_block->map_flags & MMU_MAP_WRITE) != 0 && mmu->l1_resident[pbid] != 0) {
+    if (meta->pin_count > 0) {
+        if (!mmu->block_directory->decrement_pin_count(pbid)) {
+            return MMU_ERR_INTERNAL;
+        }
+    }
+
+    if ((mapped_block->map_flags & MMU_MAP_WRITE) != 0) {
+        (void)mmu->block_directory->set_dirty(pbid, true);
+    }
+
+    if ((mapped_block->map_flags & MMU_MAP_WRITE) != 0 && meta->resident_in_l1) {
         mmu_status_t sync_status = SyncL1ToL2(mmu, pbid);
         if (sync_status != MMU_STATUS_OK) {
             return sync_status;
         }
+        (void)mmu->block_directory->set_dirty(pbid, false);
     }
 
     TouchBlock(mmu, pbid);
@@ -978,9 +1031,28 @@ mmu_status_t mmu_test_update_mapping(mmu_handle_t mmu,
         return MMU_ERR_INVALID_ARGUMENT;
     }
 
-    mmu_status_t status = context->impl.UpdateMapping(lvid, static_cast<int>(new_physical_block), new_tier);
+    physical_route_t previous_route{};
+    mmu_status_t status = context->impl.ResolveRouting(lvid, &previous_route);
     if (status != MMU_STATUS_OK) {
         return status;
+    }
+
+    const bool same_block = previous_route.physical_block_id == new_physical_block;
+    status = context->impl.UpdateMapping(lvid, static_cast<int>(new_physical_block));
+    if (status != MMU_STATUS_OK) {
+        return status;
+    }
+
+    if (!same_block) {
+        (void)mmu->block_directory->initialize_fresh_block(static_cast<int>(new_physical_block));
+        if (mmu->l1_allocator->ref_count(previous_route.physical_block_id) == 0) {
+            const dsf_mmu::core::BlockMeta* old_meta = BlockMetaFor(mmu, previous_route.physical_block_id);
+            if (old_meta != nullptr && old_meta->resident_in_l1 && mmu->resident_count > 0) {
+                --mmu->resident_count;
+            }
+            ResetBlockData(mmu, previous_route.physical_block_id);
+            mmu->block_directory->reset(previous_route.physical_block_id);
+        }
     }
 
     if (new_tier == MMU_TIER_L1) {
@@ -991,6 +1063,34 @@ mmu_status_t mmu_test_update_mapping(mmu_handle_t mmu,
     }
 
     return MMU_ERR_INVALID_ARGUMENT;
+}
+
+mmu_status_t mmu_test_get_block_metadata(mmu_handle_t mmu,
+                                         int32_t block_id,
+                                         mmu_test_block_metadata_t* out_metadata) {
+    if (mmu == nullptr) {
+        return MMU_ERR_BAD_HANDLE;
+    }
+    if (out_metadata == nullptr || block_id < 0) {
+        return MMU_ERR_INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::recursive_mutex> guard(mmu->api_mutex);
+
+    dsf_mmu::core::BlockMeta meta{};
+    if (!mmu->block_directory->snapshot(static_cast<int>(block_id), &meta)) {
+        return MMU_ERR_INVALID_ARGUMENT;
+    }
+
+    out_metadata->allocated = meta.allocated ? 1u : 0u;
+    out_metadata->tier = meta.tier;
+    out_metadata->resident_in_l1 = meta.resident_in_l1 ? 1u : 0u;
+    out_metadata->dirty = meta.dirty ? 1u : 0u;
+    out_metadata->pin_count = meta.pin_count;
+    out_metadata->last_access_epoch = meta.last_access_epoch;
+    out_metadata->l1_frame_id = meta.l1_frame_id;
+    out_metadata->l2_slot_id = meta.l2_slot_id;
+    out_metadata->has_l2_backing = meta.has_l2_backing ? 1u : 0u;
+    return MMU_STATUS_OK;
 }
 
 mmu_status_t mmu_test_get_committed_page_counts(mmu_handle_t mmu,

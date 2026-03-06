@@ -10,6 +10,7 @@ option(MMU_BUILD_EXAMPLES "Build examples" ON)
 
 add_library(dsf_mmu
     src/mmu_api.cpp
+    src/core/block_directory.cpp
     src/core/block_manager.cpp
     src/core/page_table.cpp
     src/core/context.cpp
@@ -41,6 +42,7 @@ if(MMU_BUILD_TESTS)
         tests/test_api_contract.cpp
         tests/test_fork_shared_block.cpp
         tests/test_mapped_pointer.cpp
+        tests/test_p0_metadata_skeleton.cpp
         tests/test_parallel_global_lock.cpp
         tests/test_page_table_mapping.cpp
         tests/test_out_of_bounds.cpp

@@ -3,8 +3,8 @@
 namespace dsf_mmu {
 namespace core {
 
-bool PageTable::append(int physical_block_id, mmu_tier_t tier) {
-    entries_.push_back(PageEntry{physical_block_id, tier});
+bool PageTable::append(int block_id) {
+    entries_.push_back(PageEntry{block_id});
     return true;
 }
 
